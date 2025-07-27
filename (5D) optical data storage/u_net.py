@@ -1,37 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-Created on Sat Jul 19 17:17:07 2025
-
-@author: zhuqi
-"""
-
-# -*- coding: utf-8 -*-
-"""
-Created on Sat Jul 19 11:29:28 2025
-
-@author: zhuqi
-"""
-
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Created on Sat Jul 19 10:24:21 2025
-
-@author: zhuqiao
-"""
-# -*- coding: utf-8 -*-
-"""
-Created on Fri Jul 18 17:34:14 2025
-
-@author: zhuqi
-"""
-
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-最终优化版 v13 - 使用70%无噪声和30%有噪声的混合数据进行训练
-"""
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -45,7 +11,7 @@ import math
 import os
 import pandas as pd
 
-#不像一般监督学习那样是 $(x_i, y_i)$ 对应关系，而是所有 $x_i$ 对应同一个 $y$
+
 # ==============================================================================
 # Part 1: Global Setup and Data Generation
 # ==============================================================================
@@ -123,8 +89,7 @@ physics_generator = FullPhysicsGenerator(M, N)
 delta_np, psi_np = DELTA_TRUE.numpy(), PSI_TRUE.numpy()
 
 # ======================= [MODIFICATION START] =======================
-# 此处为修改的核心区域
-#
+
 # 定义训练数据中无噪音和有噪音数据的比例
 ideal_ratio = 0.6
 num_ideal_train = int(num_train_pairs * ideal_ratio)
