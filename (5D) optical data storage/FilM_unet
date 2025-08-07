@@ -1,0 +1,411 @@
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader, random_split
+import torch.nn.functional as F
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+import numpy as np
+import time
+from tqdm import tqdm
+import math
+import os
+import pandas as pd
+import random
+
+# ==============================================================================
+# Part 1: Configuration
+# ==============================================================================
+print("="*60)
+print("Part 1: (V5) Loading Datasets for Mixed Training")
+print("="*60)
+
+# --- Configuration ---
+DATA_DIR = "datasets_physics_two_stage_new"
+BATCH_SIZE = 8
+EPOCHS = 1000 # A single training stage might require more epochs
+LEARNING_RATE = 3e-4
+VALIDATION_SPLIT = 0.15
+PATIENCE_LR_SCHEDULER = 20
+PATIENCE_EARLY_STOP = 500
+MODEL_PATH = 'best_model_mixed_training.pt'
+RANDOM_SEED = 42 # Seed for reproducibility
+
+# --- [NEW] Function to set seed for reproducibility ---
+def set_seed(seed_value):
+    """Set seed for reproducibility in python, numpy, and torch."""
+    random.seed(seed_value)
+    np.random.seed(seed_value)
+    torch.manual_seed(seed_value)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed_value)
+        torch.cuda.manual_seed_all(seed_value) # for multi-GPU.
+        # The two lines below are often used for full reproducibility
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+# ==============================================================================
+# Part 2: Dataset Class and Model Definitions
+# ==============================================================================
+
+class PhysicsInverseDataset(Dataset):
+    """
+    Custom PyTorch Dataset to handle the structured physics data.
+    It prepares the input tensor by stacking multiple measurements and their
+    parameters (alpha, beta) into channels. It also provides the conditional
+    k-value and the ground truth labels.
+    """
+    def __init__(self, structured_data):
+        self.data = structured_data
+        if not self.data:
+            self.num_conditions = 0
+        else:
+            self.num_conditions = len(structured_data[0]['measurements'])
+    
+    def __len__(self):
+        return len(self.data)
+        
+    def __getitem__(self, idx):
+        object_data = self.data[idx]
+        
+        # Extract k-value for conditioning
+        k_val = torch.tensor(object_data['k_value'], dtype=torch.long)
+        
+        # Prepare the multi-channel input tensor
+        all_measurements = object_data['measurements']
+        measurement_tensors = []
+        for m in all_measurements:
+            image = m['image'].unsqueeze(0)
+            params = m['params']
+            alpha, beta = params[0], params[1]
+            
+            # Create channels for alpha and beta to match image dimensions
+            alpha_ch = torch.full_like(image, alpha)
+            beta_ch = torch.full_like(image, beta)
+            
+            # Concatenate the three channels (Image, Alpha, Beta)
+            three_channels = torch.cat([image, alpha_ch, beta_ch], dim=0)
+            measurement_tensors.append(three_channels)
+            
+        # Stack all measurement conditions along a new dimension
+        input_tensor = torch.stack(measurement_tensors)
+        
+        # Get the ground truth label
+        label_original = object_data['label']
+        
+        return input_tensor, k_val, label_original
+
+class FiLMLayer(nn.Module):
+    """Feature-wise Linear Modulation layer."""
+    def forward(self, x, gamma, beta):
+        # Reshape gamma and beta for broadcasting: [B, C] -> [B, C, 1, 1]
+        return gamma.unsqueeze(-1).unsqueeze(-1) * x + beta.unsqueeze(-1).unsqueeze(-1)
+
+class k_Conditioner(nn.Module):
+    """Generates FiLM parameters (gamma, beta) from the k-value."""
+    def __init__(self, output_channels, k_embedding_dim=32):
+        super().__init__()
+        # k ranges from 1-20, so we need 21 embeddings for indices 0-20.
+        self.embedding = nn.Embedding(num_embeddings=21, embedding_dim=k_embedding_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(k_embedding_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, output_channels * 2) # *2 for gamma and beta
+        )
+        self.output_channels = output_channels
+
+    def forward(self, k_values): # k_values shape: [B]
+        embedded_k = self.embedding(k_values)
+        params = self.mlp(embedded_k)
+        # Split the output into gamma and beta
+        gamma = params[:, :self.output_channels]
+        beta = params[:, self.output_channels:]
+        return gamma, beta
+
+class UNet_FiLM(nn.Module):
+    """
+    A standard U-Net architecture (with pooling and upsampling) that is
+    conditioned on the k-value using FiLM layers. It processes a stack
+    of all measurements simultaneously for efficiency.
+    """
+    def __init__(self, in_channels, out_channels=2):
+        super(UNet_FiLM, self).__init__()
+        
+        def _conv_block(in_c, out_c):
+            return nn.Sequential(
+                nn.Conv2d(in_c, out_c, kernel_size=3, padding=1),
+                nn.BatchNorm2d(out_c),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(out_c, out_c, kernel_size=3, padding=1),
+                nn.BatchNorm2d(out_c),
+                nn.ReLU(inplace=True)
+            )
+
+        # --- Encoder ---
+        self.enc1 = _conv_block(in_channels, 64)
+        self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.enc2 = _conv_block(64, 128)
+        self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)
+        
+        # --- Bottleneck ---
+        self.bottleneck = _conv_block(128, 256)
+
+        # --- FiLM Integration ---
+        self.film_layer = FiLMLayer()
+        self.k_conditioner1 = k_Conditioner(output_channels=64)
+        self.k_conditioner2 = k_Conditioner(output_channels=128)
+
+        # --- Decoder ---
+        self.upconv2 = nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2)
+        self.dec2 = _conv_block(256, 128) # 128 from upconv + 128 from skip
+        self.upconv1 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
+        self.dec1 = _conv_block(128, 64)  # 64 from upconv + 64 from skip
+        
+        # --- Output Layer ---
+        self.out_conv = nn.Conv2d(64, out_channels, kernel_size=1)
+        self.final_activation = nn.Sigmoid()
+
+    def forward(self, x, k_values):
+        # x has shape [B, num_measurements, 3, H, W]
+        # k_values has shape [B]
+        
+        batch_size = x.shape[0]
+        # Flatten the measurement and channel dimensions
+        in_channels_flat = x.shape[1] * x.shape[2]
+        x_flat = x.view(batch_size, in_channels_flat, x.shape[3], x.shape[4])
+
+        # --- Encoder Path with FiLM ---
+        e1_raw = self.enc1(x_flat)
+        gamma1, beta1 = self.k_conditioner1(k_values)
+        e1 = self.film_layer(e1_raw, gamma1, beta1) # Modulate features
+        
+        p1 = self.pool1(e1)
+        
+        e2_raw = self.enc2(p1)
+        gamma2, beta2 = self.k_conditioner2(k_values)
+        e2 = self.film_layer(e2_raw, gamma2, beta2) # Modulate features
+
+        p2 = self.pool2(e2)
+
+        # --- Bottleneck ---
+        b = self.bottleneck(p2)
+
+        # --- Decoder Path ---
+        d2 = self.upconv2(b)
+        # Handle potential size mismatch after transpose conv
+        if d2.shape[2:] != e2.shape[2:]:
+            d2 = F.interpolate(d2, size=e2.shape[2:], mode='bilinear', align_corners=True)
+        # Concatenate skip connection from modulated feature map
+        d2 = self.dec2(torch.cat([d2, e2], dim=1))
+
+        d1 = self.upconv1(d2)
+        if d1.shape[2:] != e1.shape[2:]:
+            d1 = F.interpolate(d1, size=e1.shape[2:], mode='bilinear', align_corners=True)
+        # Concatenate skip connection from modulated feature map
+        d1 = self.dec1(torch.cat([d1, e1], dim=1))
+
+        # --- Output ---
+        normalized_output = self.final_activation(self.out_conv(d1))
+        
+        # Rescale to physical values
+        pi = torch.tensor(math.pi, device=normalized_output.device, dtype=normalized_output.dtype)
+        scaling = torch.tensor([pi, pi / 2.0], device=normalized_output.device, dtype=normalized_output.dtype).view(1, 2, 1, 1)
+        physical_output = normalized_output * scaling
+
+        return physical_output
+
+class EarlyStopping:
+    """Stops training when a monitored metric has stopped improving."""
+    def __init__(self, patience=20, verbose=True, delta=0, path='checkpoint.pt', trace_func=print):
+        self.patience, self.verbose, self.delta, self.path = patience, verbose, delta, path
+        self.trace_func = trace_func
+        self.counter = 0
+        self.best_score = None
+        self.early_stop = False
+        self.val_loss_min = np.Inf
+
+    def __call__(self, val_loss, model):
+        score = -val_loss
+        if self.best_score is None:
+            self.best_score = score
+            self.save_checkpoint(val_loss, model)
+        elif score < self.best_score + self.delta:
+            self.counter += 1
+            if self.verbose:
+                self.trace_func(f'EarlyStopping counter: {self.counter} out of {self.patience}')
+            if self.counter >= self.patience:
+                self.early_stop = True
+        else:
+            self.best_score = score
+            self.save_checkpoint(val_loss, model)
+            self.counter = 0
+
+    def save_checkpoint(self, val_loss, model):
+        if self.verbose:
+            self.trace_func(f'Validation loss decreased ({self.val_loss_min:.6f} --> {val_loss:.6f}). Saving model ...')
+        torch.save(model.state_dict(), self.path)
+        self.val_loss_min = val_loss
+
+# ==============================================================================
+# Part 3: Helper Functions
+# ==============================================================================
+
+def criterion(predictions_physical, labels_original):
+    """
+    Custom loss function. Normalizes predictions and labels to [0, 1] before
+    calculating MSE loss to ensure balanced contribution from delta and psi.
+    """
+    pred_norm_delta = predictions_physical[:, 0, :, :] / math.pi
+    pred_norm_psi = predictions_physical[:, 1, :, :] / (math.pi / 2.0)
+    
+    label_norm_delta = labels_original[:, 0, :, :] / math.pi
+    label_norm_psi = labels_original[:, 1, :, :] / (math.pi / 2.0)
+    
+    loss_delta = F.mse_loss(pred_norm_delta, label_norm_delta)
+    loss_psi = F.mse_loss(pred_norm_psi, label_norm_psi)
+    
+    return loss_delta + loss_psi
+
+def evaluate_and_save_detailed_report(loader, model, device, report_name):
+    """Evaluates the model on a given dataset and saves a detailed CSV report."""
+    print("\n" + "="*60 + f"\nGenerating Detailed Report for: {report_name}\n" + "="*60)
+    model.eval()
+    results_list = []
+    with torch.no_grad():
+        for i, (inputs, k_vals, labels_original) in enumerate(tqdm(loader, desc=f"Evaluating {report_name}")):
+            inputs, k_vals = inputs.to(device), k_vals.to(device)
+            predictions_physical = model(inputs, k_vals).cpu()
+            
+            for j in range(inputs.size(0)):
+                sample_id = i * loader.batch_size + j
+                pred_delta, pred_psi = predictions_physical[j, 0], predictions_physical[j, 1]
+                true_delta, true_psi = labels_original[j, 0], labels_original[j, 1]
+                
+                # Calculate error metrics
+                f_err_delta = torch.norm(pred_delta - true_delta, p='fro').item()
+                f_err_psi = torch.norm(pred_psi - true_psi, p='fro').item()
+                max_abs_err_delta = torch.max(torch.abs(pred_delta - true_delta)).item()
+                max_abs_err_psi = torch.max(torch.abs(pred_psi - true_psi)).item()
+                k_value_tested = k_vals[j].item()
+                
+                results_list.append({
+                    "Sample_ID": sample_id, "k_value": k_value_tested,
+                    "Delta_F_Error": f_err_delta, "Psi_F_Error": f_err_psi,
+                    "Delta_MaxAbs_Error": max_abs_err_delta, "Psi_MaxAbs_Error": max_abs_err_psi
+                })
+                
+    report_df = pd.DataFrame(results_list)
+    csv_filename = f"report_{report_name}.csv"
+    report_df.to_csv(csv_filename, index=False)
+    print(f"\n Detailed report saved to '{csv_filename}'")
+    print(f"\nError Statistics Summary for {report_name}:")
+    print(report_df.describe())
+
+# ==============================================================================
+# Part 4: Main Execution Block
+# ==============================================================================
+def main():
+    """Main function to handle the single-stage training and evaluation."""
+    
+    # --- [NEW] Set Seed for Reproducibility ---
+    set_seed(RANDOM_SEED)
+    print(f"Random seed set to {RANDOM_SEED}")
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # --- Load all datasets ---
+    try:
+        # Correctly load the single mixed training file
+        train_data_mixed_raw = torch.load(os.path.join(DATA_DIR, "train_data_mixed.pth"))
+        # Load all four test sets
+        test_seen_ideal_raw = torch.load(os.path.join(DATA_DIR, "test_seen_ideal.pth"))
+        test_seen_noisy_raw = torch.load(os.path.join(DATA_DIR, "test_seen_noisy.pth"))
+        test_unseen_ideal_raw = torch.load(os.path.join(DATA_DIR, "test_unseen_ideal.pth"))
+        test_unseen_noisy_raw = torch.load(os.path.join(DATA_DIR, "test_unseen_noisy.pth"))
+        print("All datasets loaded successfully.")
+    except FileNotFoundError as e:
+        print(f"Error: Dataset file not found: {e.filename}.")
+        print(f"Please run the data generation script from the Canvas first.")
+        return
+
+    # --- Prepare Datasets and DataLoaders ---
+    full_dataset = PhysicsInverseDataset(train_data_mixed_raw)
+    val_size = int(VALIDATION_SPLIT * len(full_dataset))
+    train_size = len(full_dataset) - val_size
+    train_ds, val_ds = random_split(full_dataset, [train_size, val_size])
+    
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
+    
+    # Create DataLoaders for all four test sets
+    test_loader_seen_ideal = DataLoader(PhysicsInverseDataset(test_seen_ideal_raw), batch_size=BATCH_SIZE)
+    test_loader_seen_noisy = DataLoader(PhysicsInverseDataset(test_seen_noisy_raw), batch_size=BATCH_SIZE)
+    test_loader_unseen_ideal = DataLoader(PhysicsInverseDataset(test_unseen_ideal_raw), batch_size=BATCH_SIZE)
+    test_loader_unseen_noisy = DataLoader(PhysicsInverseDataset(test_unseen_noisy_raw), batch_size=BATCH_SIZE)
+
+    # --- Prepare Model ---
+    if not train_data_mixed_raw:
+        print("Error: Training data is empty. Cannot initialize model.")
+        return
+        
+    in_channels = full_dataset.num_conditions * 3 # I, alpha, beta for each condition
+    model = UNet_FiLM(in_channels=in_channels, out_channels=2).to(device)
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"\nModel: UNet_FiLM created on {device}. Trainable params: {total_params/1e6:.2f}M")
+    
+    # --- Single-Stage Training ---
+    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    scheduler = ReduceLROnPlateau(optimizer, 'min', factor=0.5, patience=PATIENCE_LR_SCHEDULER, verbose=True)
+    early_stopping = EarlyStopping(patience=PATIENCE_EARLY_STOP, verbose=True, path=MODEL_PATH)
+
+    print("\n" + "="*60 + "\nStarting Unified Training on Mixed Dataset\n" + "="*60)
+    start_time = time.time()
+
+    for epoch in range(EPOCHS):
+        model.train()
+        epoch_train_loss = 0
+        train_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}", leave=False)
+        for inputs, k_vals, labels_original in train_pbar:
+            inputs, k_vals, labels_original = inputs.to(device), k_vals.to(device), labels_original.to(device)
+            optimizer.zero_grad()
+            predictions_physical = model(inputs, k_vals)
+            loss = criterion(predictions_physical, labels_original)
+            loss.backward()
+            optimizer.step()
+            epoch_train_loss += loss.item() * inputs.size(0)
+            train_pbar.set_postfix(loss=f"{loss.item():.6f}")
+        
+        avg_train_loss = epoch_train_loss / len(train_loader.dataset)
+
+        model.eval()
+        epoch_val_loss = 0
+        with torch.no_grad():
+            for inputs, k_vals, labels_original in val_loader:
+                inputs, k_vals, labels_original = inputs.to(device), k_vals.to(device), labels_original.to(device)
+                predictions_physical = model(inputs, k_vals)
+                loss = criterion(predictions_physical, labels_original)
+                epoch_val_loss += loss.item() * inputs.size(0)
+        
+        avg_val_loss = epoch_val_loss / len(val_loader.dataset)
+        
+        print(f"Epoch {epoch+1}/{EPOCHS} | Train Loss: {avg_train_loss:.6f} | Val Loss: {avg_val_loss:.6f} | LR: {optimizer.param_groups[0]['lr']:.2e}")
+        scheduler.step(avg_val_loss)
+        early_stopping(avg_val_loss, model)
+        if early_stopping.early_stop:
+            print(f"\nEarly stopping triggered after epoch {epoch+1}.")
+            break
+            
+    print(f"\n Training finished in {time.time() - start_time:.2f} seconds.")
+    print(f"Loading best model from checkpoint: '{early_stopping.path}'")
+    model.load_state_dict(torch.load(early_stopping.path, map_location=device))
+
+    # --- Final Evaluation on all four test sets ---
+    print("\n" + "="*60 + "\nStarting Final Evaluation on All Test Sets...\n" + "="*60)
+    
+    evaluate_and_save_detailed_report(test_loader_seen_ideal, model, device, report_name="test_seen_labels_ideal_inputs")
+    evaluate_and_save_detailed_report(test_loader_seen_noisy, model, device, report_name="test_seen_labels_noisy_inputs")
+    evaluate_and_save_detailed_report(test_loader_unseen_ideal, model, device, report_name="test_unseen_labels_ideal_inputs")
+    evaluate_and_save_detailed_report(test_loader_unseen_noisy, model, device, report_name="test_unseen_labels_noisy_inputs")
+
+if __name__ == '__main__':
+    main()
