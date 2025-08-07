@@ -1,0 +1,241 @@
+
+import torch
+import numpy as np
+import os
+import random
+from tqdm import tqdm
+import math
+
+# ==============================================================================
+# Part 1: Global Setup and Data Generation
+# ==============================================================================
+print("="*60)
+print("Part 1: Generating Datasets for Training and Evaluation")
+print("="*60)
+
+# --- Dataset Parameters ---
+M, N = 10, 10
+NUM_TRAIN_OBJECTS = 2000  # Number of training objects
+NUM_TEST_SEEN_OBJECTS = 20   # Number of objects for "seen" tests
+NUM_TEST_UNSEEN_OBJECTS = 20 # Number of objects for "unseen" tests
+NUM_CONDITIONS = 20
+OUTPUT_DIR = "datasets_physics_2000_20" # New output folder
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+def generate_labels(num_sets, seed):
+    np.random.seed(seed)
+    labels_list = []
+    for _ in range(num_sets):
+        delta = torch.from_numpy(np.pi * np.random.rand(M, N)).float()
+        psi = torch.from_numpy((np.pi / 2) * np.random.rand(M, N)).float()
+        labels_list.append(torch.stack([delta, psi], dim=0))
+    return labels_list
+
+class FullPhysicsGenerator:
+    """
+    A Python implementation that mirrors the updated MATLAB physics model for 
+    calculating ideal and noisy intensity images.
+    """
+    def __init__(self, m=10, n=10):
+        self.m, self.n = m, n
+        self.N_layers = 20
+        self.h = 1.0
+        self.w = 1.0
+        self.d = 0.02
+        self.theta = np.deg2rad(20)
+        self.tau = 0.98
+        self.I_min = 0.001
+        self.sigma_add = 0.05
+        self.sigma_scr = 0.05
+        self.sigma_Delta = 0.05
+        self.sigma_Psi = 0.05
+        self.E0 = np.array([[1], [0]], dtype=np.complex128)
+
+    def _R(self, theta):
+        c, s = np.cos(theta), np.sin(theta)
+        return np.array([[c, -s], [s, c]], dtype=np.complex128)
+
+    def _Jr(self, phi):
+        return np.array([[np.exp(-1j * phi / 2), 0], 
+                         [0, np.exp(1j * phi / 2)]], dtype=np.complex128)
+
+    def _Jr_ret(self, Delta, psi):
+        return self._R(-psi) @ self._Jr(Delta) @ self._R(psi)
+
+    def _rand_Jones(self):
+        eps = 0.01 * np.random.randn()
+        theta = np.pi * np.random.rand()
+        return self._R(-theta) @ self._Jr(eps) @ self._R(theta)
+
+    def _sum_rand_Jones(self, Nn):
+        if Nn <= 0:
+            return np.zeros((2, 2), dtype=np.complex128)
+        S = np.zeros((2, 2), dtype=np.complex128)
+        for _ in range(Nn):
+            S += self._rand_Jones()
+        return S
+
+    def generate_one_noisy_image(self, alpha, beta, k, delta_true_np, psi_true_np):
+        I_noisy = np.zeros_like(delta_true_np, dtype=np.float64)
+        m, n = delta_true_np.shape
+        J1 = np.array([[1, 0], [0, 0]], dtype=np.complex128)
+        J2 = self._R(-np.pi/4) @ self._Jr(alpha) @ self._R(np.pi/4)
+        J3 = self._Jr(beta)
+        J5 = self._R(-np.pi/4) @ self._Jr(np.pi/4) @ self._R(np.pi/4)
+        J6 = np.array([[1, 0], [0, 0]], dtype=np.complex128)
+        eps_scr = np.random.randn() * self.sigma_scr
+        I_add = np.random.randn() * self.sigma_add
+        layer_indices = np.arange(1, self.N_layers + 1)
+        lambda_vals = 1 / (np.abs(layer_indices - k) + 1)
+        if np.max(lambda_vals) > 0:
+            lambda_vals = 0.000001 * (lambda_vals / np.max(lambda_vals))
+        for i in range(m):
+            for j in range(n):
+                delta_val = delta_true_np[i, j] + np.random.randn() * self.sigma_Delta
+                psi_val = psi_true_np[i, j] + np.random.randn() * self.sigma_Psi
+                J4 = np.eye(2, dtype=np.complex128)
+                for nlayer in range(self.N_layers, 0, -1):
+                    if nlayer == k:
+                        Jn = self._Jr_ret(delta_val, psi_val)
+                    else:
+                        Rn = np.abs(nlayer - k) * self.h * np.tan(self.theta)
+                        r = Rn / self.w
+                        r_floor = int(np.floor(r))
+                        if r_floor > 0:
+                            sqrt_terms = np.sqrt(r**2 - np.arange(1, r_floor + 1)**2)
+                            Nn = int(1 + 4 * r_floor + 4 * np.sum(np.floor(sqrt_terms)))
+                        else:
+                            Nn = 1
+                        Jn = np.eye(2, dtype=np.complex128) + lambda_vals[nlayer-1] * (self.d / Nn) * self._sum_rand_Jones(Nn)
+                    J4 = J4 @ Jn
+                Jps = J6 @ J5 @ J4 @ J3 @ J2 @ J1
+                Eout = Jps @ self.E0
+                I_raw = self.tau * (np.linalg.norm(Eout)**2)
+                I_noisy[i, j] = I_raw * (1 + eps_scr) + self.I_min + I_add
+        return torch.from_numpy(I_noisy).float()
+
+    def generate_one_ideal_image(self, alpha, beta, delta_true_np, psi_true_np):
+        I_ideal = np.zeros_like(delta_true_np, dtype=np.float64)
+        m, n = delta_true_np.shape
+        J1 = np.array([[1, 0], [0, 0]], dtype=np.complex128)
+        J2 = self._R(-np.pi/4) @ self._Jr(alpha) @ self._R(np.pi/4)
+        J3 = self._Jr(beta)
+        J5 = self._R(-np.pi/4) @ self._Jr(np.pi/4) @ self._R(np.pi/4)
+        J6 = np.array([[1, 0], [0, 0]], dtype=np.complex128)
+        for i in range(m):
+            for j in range(n):
+                delta_val = delta_true_np[i, j]
+                psi_val = psi_true_np[i, j]
+                J4 = self._Jr_ret(delta_val, psi_val)
+                Jps = J6 @ J5 @ J4 @ J3 @ J2 @ J1
+                Eout = Jps @ self.E0
+                I_ideal[i, j] = self.tau * (np.linalg.norm(Eout)**2) + self.I_min
+        return torch.from_numpy(I_ideal).float()
+
+def generate_dataset(labels_list, ab_pairs, dataset_type, dataset_name, k_sampling_method='random'):
+    all_objects_data = []
+    physics_generator = FullPhysicsGenerator(M, N)
+    desc = f"Generating {dataset_name} ({dataset_type})"
+    for label in tqdm(labels_list, desc=desc):
+        k_values_to_process = []
+        if dataset_type == 'ideal':
+            k_values_to_process.append(1) 
+        elif k_sampling_method == 'random':
+            k_values_to_process.append(random.randint(1, 20))
+        elif k_sampling_method == 'traverse':
+            k_values_to_process.extend(range(1, 21))
+        for k in k_values_to_process:
+            measurements = []
+            delta_np, psi_np = label[0].numpy(), label[1].numpy()
+            for alpha, beta in ab_pairs:
+                if dataset_type == 'ideal':
+                    image = physics_generator.generate_one_ideal_image(alpha, beta, delta_np, psi_np)
+                elif dataset_type == 'noisy':
+                    image = physics_generator.generate_one_noisy_image(alpha, beta, k, delta_np, psi_np)
+                else:
+                    raise ValueError("dataset_type must be 'ideal' or 'noisy'")
+                measurements.append({'image': image, 'params': torch.tensor((alpha, beta), dtype=torch.float32)})
+            all_objects_data.append({
+                'label': label, 
+                'measurements': measurements,
+                'k_value': k
+            })
+    return all_objects_data
+
+def main():
+    """Main execution function."""
+    # 1. Generate Labels
+    print(f"Generating labels for training and testing...")
+    train_labels = generate_labels(NUM_TRAIN_OBJECTS, seed=42)
+    
+    # --- [CORRECTED LOGIC] ---
+    # "Seen" test labels are now a random sample from the training labels
+    random.seed(123) # Use a seed for reproducibility of the sample
+    test_labels_seen = random.sample(train_labels, NUM_TEST_SEEN_OBJECTS)
+    print(f"Created 'seen' test set by sampling {NUM_TEST_SEEN_OBJECTS} labels from the training set.")
+
+    # "Unseen" test labels are generated with a completely different seed
+    test_labels_unseen = generate_labels(NUM_TEST_UNSEEN_OBJECTS, seed=456)
+    print(f"Created 'unseen' test set with {NUM_TEST_UNSEEN_OBJECTS} new labels.")
+
+    # 2. Generate Measurement Conditions
+    ab_pairs = []
+    chi_rad = np.deg2rad(20)
+    specific_ab_pairs = [
+        (np.deg2rad(90), np.deg2rad(180)), 
+        (np.deg2rad(90) - chi_rad, np.deg2rad(180)), 
+        (np.deg2rad(90) + chi_rad, np.deg2rad(180)), 
+        (np.deg2rad(90), np.deg2rad(180) - chi_rad), 
+        (np.deg2rad(90), np.deg2rad(180) + chi_rad)
+    ]
+    ab_pairs.extend(specific_ab_pairs)
+    np.random.seed(101)
+    num_random_pairs = NUM_CONDITIONS - len(specific_ab_pairs)
+    if num_random_pairs > 0:
+        random_alphas = np.pi * np.random.rand(num_random_pairs)
+        random_betas = np.pi * np.random.rand(num_random_pairs)
+        ab_pairs.extend(list(zip(random_alphas, random_betas)))
+    print(f"Generated a shared set of {len(ab_pairs)} measurement conditions.")
+
+    # 3. Generate Mixed Training Set
+    print("\nGenerating mixed training set...")
+    num_train_half = NUM_TRAIN_OBJECTS // 2
+    ideal_train_labels = train_labels[:num_train_half]
+    noisy_train_labels = train_labels[num_train_half:]
+    train_data_ideal_part = generate_dataset(ideal_train_labels, ab_pairs, dataset_type='ideal', 
+                                             dataset_name="Train Set (Ideal Part)")
+    train_data_noisy_part = generate_dataset(noisy_train_labels, ab_pairs, dataset_type='noisy', 
+                                             dataset_name="Train Set (Noisy Part)", k_sampling_method='random')
+    train_data_mixed = train_data_ideal_part + train_data_noisy_part
+    random.shuffle(train_data_mixed)
+    
+    # 4. Generate Test Sets
+    print("\nGenerating test sets...")
+    test_data_seen_ideal = generate_dataset(test_labels_seen, ab_pairs, dataset_type='ideal', 
+                                            dataset_name="Test Set (Seen Labels, Ideal Inputs)")
+    test_data_seen_noisy = generate_dataset(test_labels_seen, ab_pairs, dataset_type='noisy', 
+                                            dataset_name="Test Set (Seen Labels, Noisy Inputs)", k_sampling_method='traverse')
+    test_data_unseen_ideal = generate_dataset(test_labels_unseen, ab_pairs, dataset_type='ideal', 
+                                              dataset_name="Test Set (Unseen Labels, Ideal Inputs)")
+    test_data_unseen_noisy = generate_dataset(test_labels_unseen, ab_pairs, dataset_type='noisy', 
+                                              dataset_name="Test Set (Unseen Labels, Noisy Inputs)", k_sampling_method='traverse')
+
+    # 5. Save All Datasets
+    print("\n" + "="*60 + "\nSaving datasets to disk...")
+    torch.save(train_data_mixed, os.path.join(OUTPUT_DIR, "train_data_mixed.pth"))
+    print(f"-> Saved {len(train_data_mixed)} mixed training samples.")
+    torch.save(test_data_seen_ideal, os.path.join(OUTPUT_DIR, "test_seen_ideal.pth"))
+    print(f"-> Saved {len(test_data_seen_ideal)} test samples (seen labels, ideal inputs).")
+    torch.save(test_data_seen_noisy, os.path.join(OUTPUT_DIR, "test_seen_noisy.pth"))
+    print(f"-> Saved {len(test_data_seen_noisy)} test samples (seen labels, noisy inputs).")
+    torch.save(test_data_unseen_ideal, os.path.join(OUTPUT_DIR, "test_unseen_ideal.pth"))
+    print(f"-> Saved {len(test_data_unseen_ideal)} test samples (unseen labels, ideal inputs).")
+    torch.save(test_data_unseen_noisy, os.path.join(OUTPUT_DIR, "test_unseen_noisy.pth"))
+    print(f"-> Saved {len(test_data_unseen_noisy)} test samples (unseen labels, noisy inputs).")
+    
+    print("\n All datasets have been generated and saved.")
+    print("="*60)
+
+if __name__ == '__main__':
+    main()
